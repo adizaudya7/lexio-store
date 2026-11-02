@@ -1,0 +1,168 @@
+name: Lexio Store APK
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      aksi:
+        description: "Pilih aksi"
+        type: choice
+        default: "build-apk"
+        options:
+          - build-apk
+          - buat-keystore
+
+permissions:
+  contents: write
+
+jobs:
+  keystore:
+    name: Buat keystore (sekali saja)
+    if: github.event_name == 'workflow_dispatch' && inputs.aksi == 'buat-keystore'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Buat kunci tanda tangan
+        run: |
+          PASS=$(openssl rand -hex 12)
+          keytool -genkeypair -keystore lexio.jks -alias lexio -keyalg RSA -keysize 2048 -validity 36500 \
+            -storepass "$PASS" -keypass "$PASS" -dname "CN=Lexio Store, O=Lexio Store, C=ID"
+          B64=$(base64 -w0 lexio.jks)
+          SHA1=$(keytool -list -v -keystore lexio.jks -storepass "$PASS" | grep "SHA1:" | head -1 | sed 's/.*SHA1: *//')
+          SHA256=$(keytool -list -v -keystore lexio.jks -storepass "$PASS" | grep "SHA256:" | head -1 | sed 's/.*SHA256: *//')
+          {
+            echo "## Salin 4 nilai ini ke GitHub Secrets"
+            echo "Settings > Secrets and variables > Actions > New repository secret"
+            echo
+            echo "**KEYSTORE_BASE64**"
+            echo '```'
+            echo "$B64"
+            echo '```'
+            echo "**KEYSTORE_PASSWORD**"
+            echo '```'
+            echo "$PASS"
+            echo '```'
+            echo "**KEY_ALIAS**"
+            echo '```'
+            echo "lexio"
+            echo '```'
+            echo "**KEY_PASSWORD**"
+            echo '```'
+            echo "$PASS"
+            echo '```'
+            echo
+            echo "## SHA-1 untuk Firebase (Project settings > Android app > Add fingerprint)"
+            echo '```'
+            echo "$SHA1"
+            echo '```'
+            echo "SHA-256 (opsional):"
+            echo '```'
+            echo "$SHA256"
+            echo '```'
+            echo
+            echo "Setelah selesai menyalin, HAPUS run ini (Actions > run > titik tiga > Delete workflow run)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Bangun APK
+    if: github.event_name == 'push' || inputs.aksi == 'build-apk'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Siapkan folder proyek
+        run: |
+          mkdir build
+          if [ -f package.json ]; then
+            tar --exclude=./build --exclude=./.git -cf - . | tar -xf - -C build
+          elif [ -f lexio-store-app.zip ]; then
+            unzip -q lexio-store-app.zip -d build
+          else
+            echo "::error::Tidak ada package.json atau lexio-store-app.zip di repo"; exit 1
+          fi
+          mkdir -p build/firebase
+          if [ -f lexio-config.js ]; then cp lexio-config.js build/www/lexio-config.js; fi
+          if [ -f google-services.json ]; then cp google-services.json build/firebase/google-services.json; fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Pasang dependensi
+        working-directory: build
+        run: npm install --no-audit --no-fund
+
+      - name: Tentukan versi
+        working-directory: build
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "$TAG" == v* ]]; then VER="${TAG#v}"; else VER="0.0.${GITHUB_RUN_NUMBER}"; fi
+          sed -i "s/__APP_VERSION__/${VER}/g" www/index.html
+          echo "VER=${VER}" >> "$GITHUB_ENV"
+
+      - name: Isi Web client ID untuk login Google
+        working-directory: build
+        run: |
+          node -e '
+            const fs = require("fs"), vm = require("vm");
+            const w = {};
+            vm.runInNewContext(fs.readFileSync("www/lexio-config.js", "utf8"), { window: w });
+            const id = (w.LEXIO_CONFIG && w.LEXIO_CONFIG.googleWebClientId) || "";
+            if (!/\.apps\.googleusercontent\.com$/.test(id)) {
+              console.log("::warning::googleWebClientId belum diisi di lexio-config.js. Aplikasi tetap jadi, tetapi login Google belum berfungsi.");
+              process.exit(0);
+            }
+            const f = "capacitor.config.json";
+            fs.writeFileSync(f, fs.readFileSync(f, "utf8").replace("__WEB_CLIENT_ID__", id));
+            console.log("Web client ID terpasang.");
+          '
+
+      - name: Buat proyek Android dan ikon
+        working-directory: build
+        run: |
+          npx cap add android
+          npx capacitor-assets generate --android
+          npx cap sync android
+          sed -i -E "s/versionCode [0-9]+/versionCode ${GITHUB_RUN_NUMBER}/; s/versionName \"[^\"]*\"/versionName \"${VER}\"/" android/app/build.gradle
+
+      - name: Bangun APK release
+        working-directory: build/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Tanda tangan APK
+        working-directory: build
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then echo "::error::Secret KEYSTORE_BASE64 belum diisi. Jalankan aksi buat-keystore dulu."; exit 1; fi
+          echo "$KEYSTORE_BASE64" | base64 -d > lexio.jks
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          IN=$(ls android/app/build/outputs/apk/release/*.apk | head -1)
+          "$BT/zipalign" -p -f 4 "$IN" aligned.apk
+          "$BT/apksigner" sign --ks lexio.jks --ks-key-alias "$KEY_ALIAS" --ks-pass env:KEYSTORE_PASSWORD --key-pass env:KEY_PASSWORD --out "Lexio-Store-v${VER}.apk" aligned.apk
+          "$BT/apksigner" verify "Lexio-Store-v${VER}.apk"
+          rm -f lexio.jks aligned.apk
+
+      - name: Unggah ke Releases
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/Lexio-Store-v*.apk
+          generate_release_notes: true
+
+      - name: Simpan sebagai artifact (build manual)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lexio-Store-APK
+          path: build/Lexio-Store-v*.apk
