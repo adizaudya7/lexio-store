@@ -13,5 +13,5 @@ window.LEXIO_CONFIG = {
   googleWebClientId: "555555276482-ono84mqgu9kbr4gsmlhtngbnkp1ucvu8.apps.googleusercontent.com",
   /* Cek update otomatis dari GitHub Releases. Hanya berfungsi kalau repo PUBLIK.
      Kosongkan karena repo ini privat. */
-  updateRepo: ""
+  updateRepo: "adizaudya7/lexio-store"
 };
